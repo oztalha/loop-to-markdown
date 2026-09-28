@@ -9,7 +9,7 @@ Tampermonkey userscripts (or bookmarklets) that convert Microsoft Loop pages to 
 - Bold text detection
 - Code language auto-detection (Python, JavaScript, SQL, YAML, JSON, Mermaid, etc.)
 - Loop page title detection and export as the document title
-- Heading level offset in Markdown exports to preserve a single top-level `#` heading
+- Table of contents export as a nested list
 - Quip link capture
 - Clipboard fallbacks for environments where `GM_setClipboard` is unavailable
 
@@ -30,7 +30,8 @@ Tampermonkey userscripts (or bookmarklets) that convert Microsoft Loop pages to 
 Prefer a bookmarks-bar button over a browser extension? The same exporters are
 also available as bookmarklets in `dist/`.
 
-1. Open `dist/install.html` in your browser
+1. Download or clone this repo and open `dist/install.html` locally in your browser
+   (GitHub shows the file as source rather than rendering it)
 2. Drag the button you want onto your bookmarks bar:
    - `📋 Copy Loop as Markdown`
    - `📋 Copy Loop as MediaWiki`
@@ -52,7 +53,9 @@ so the two stay in sync — edit a `*.user.js`, then run
 ## Notes
 
 - Markdown exports add the detected Loop page title as `# Title` when available.
-- Loop headings are shifted down by one level in Markdown so the exported title remains the only H1.
+- Loop reserves heading level 1 for the page title, so section headings keep their Loop levels (`##` and below).
+- Collapsed and virtualized code blocks are expanded and scrolled through during export so their full text is captured;
+  the page scrolls briefly while this happens and is restored afterwards.
 - Both scripts try `GM_setClipboard`, then the browser Clipboard API, then a `document.execCommand('copy')` fallback.
 
 ## Contributors

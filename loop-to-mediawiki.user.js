@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Microsoft Loop to MediaWiki
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Convert Microsoft Loop pages to MediaWiki wikitext
-// @author       OpenAI Codex
+// @author       Andrea Scian
 // @match        https://loop.cloud.microsoft/*
 // @match        https://*.loop.cloud.microsoft.com/*
 // @grant        GM_setClipboard
+// @updateURL    https://raw.githubusercontent.com/oztalha/loop-to-markdown/main/loop-to-mediawiki.user.js
+// @downloadURL  https://raw.githubusercontent.com/oztalha/loop-to-markdown/main/loop-to-mediawiki.user.js
 // @license      GPL-3.0
 // ==/UserScript==
 
@@ -20,8 +22,12 @@
         }
 
         if (navigator.clipboard?.writeText) {
-            await navigator.clipboard.writeText(text);
-            return;
+            try {
+                await navigator.clipboard.writeText(text);
+                return;
+            } catch (e) {
+                // e.g. page not focused or permission denied; try execCommand below
+            }
         }
 
         const textarea = document.createElement('textarea');
@@ -30,8 +36,9 @@
         textarea.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
         document.body.appendChild(textarea);
         textarea.select();
-        document.execCommand('copy');
+        const copied = document.execCommand('copy');
         textarea.remove();
+        if (!copied) throw new Error('Clipboard copy failed');
     };
 
     const normalize = text => {
@@ -64,28 +71,38 @@
         for (const selector of candidateSelectors) {
             const el = document.querySelector(selector);
             const value = normalize(el?.value || el?.textContent || '');
-            if (value) return value;
+            if (value) return { text: value, el };
         }
 
-        const metaTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content');
-        if (metaTitle) return normalize(metaTitle);
+        const isGeneric = t => /^Microsoft Loop\b/i.test(t);
+        const metaTitle = normalize(document.querySelector('meta[property="og:title"]')?.getAttribute('content'));
+        if (metaTitle && !isGeneric(metaTitle)) return { text: metaTitle, el: null };
 
-        const docTitle = normalize(document.title.replace(/\s*[-|].*$/, ''));
-        if (docTitle) return docTitle;
+        const docTitle = normalize(document.title.replace(/\s+[-|]\s+.*$/, ''));
+        if (docTitle && !isGeneric(docTitle)) return { text: docTitle, el: null };
 
         const firstPara = pages[0]?.querySelector('.scriptor-paragraph:not([role="heading"] *)');
         if (firstPara && !firstPara.querySelector('[role="heading"]') && !firstPara.closest('.scriptor-listItem, table')) {
-            return normalize(firstPara.textContent);
+            return { text: normalize(firstPara.textContent), el: firstPara };
         }
 
-        return '';
+        return { text: '', el: null };
+    };
+
+    // Loop often also renders the title as the first block; mark it so it isn't emitted twice
+    const skipTitleElements = (pages, title, titleEl, processed) => {
+        const firstBlock = pages[0].querySelector('.scriptor-paragraph, [role="heading"]');
+        [titleEl, normalize(firstBlock?.textContent) === title && firstBlock]
+            .filter(Boolean)
+            .forEach(el => processed.add(el).add(el.closest('.scriptor-paragraph') || el));
     };
 
     const formatExternalLink = (label, href) => {
         const cleanLabel = normalize(label);
         if (!href) return cleanLabel;
-        if (!cleanLabel || cleanLabel === href) return href;
-        return `[${href} ${cleanLabel}]`;
+        const safeHref = href.replace(/ /g, '%20').replace(/\]/g, '%5D');
+        if (!cleanLabel || cleanLabel === href) return safeHref;
+        return `[${safeHref} ${cleanLabel.replace(/\]/g, '&#93;')}]`;
     };
 
     const formatCheckbox = checked => checked ? '☑' : '☐';
@@ -181,11 +198,61 @@
         return normalize(text);
     };
 
+    // Loop virtualizes code blocks: lines only render once the block is expanded and scrolled into view
+    const hydrateCodeBlocks = async () => {
+        const blocks = [...document.querySelectorAll('.scriptor-component-code-block')];
+        if (!blocks.length) return () => {};
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+        const scrollers = [];
+        for (let el = blocks[0].parentElement; el; el = el.parentElement) {
+            if (el.scrollHeight > el.clientHeight) scrollers.push([el, el.scrollTop]);
+        }
+        const expanded = [];
+        for (const block of blocks) {
+            const expand = block.querySelector('#expand-button[aria-label="Expand code block"]');
+            if (expand) { expand.click(); expanded.push(expand); await sleep(100); }
+            block.scrollIntoView({ block: 'start' });
+            let count = -1;
+            for (let i = 0; i < 20; i++) {
+                await sleep(150);
+                const frames = block.querySelectorAll('.scriptor-pageFrameContainer');
+                frames[frames.length - 1]?.scrollIntoView({ block: 'end' });
+                const now = block.querySelectorAll('.scriptor-paragraph').length;
+                if (now === count && now > 0) break;
+                count = now;
+            }
+        }
+        // Returns a restore function: collapse what we expanded and put the scroll position back
+        return () => {
+            expanded.forEach(btn => btn.click());
+            scrollers.forEach(([el, top]) => { el.scrollTop = top; });
+        };
+    };
+
+    // Multi-paragraph cells would otherwise run together ("here.The")
+    const getCellText = cell => {
+        const paras = [...cell.querySelectorAll('.scriptor-paragraph')];
+        if (paras.length < 2) return getTextContent(cell);
+        return paras.map(p => getTextContent(p)).filter(Boolean).join('<br>');
+    };
+
+    const renderToc = toc => {
+        const lines = ["'''Table of contents'''"];
+        toc.querySelectorAll('.scriptor-table-of-contents-entry').forEach(entry => {
+            const depth = Math.round(parseInt(entry.style.paddingInlineStart || '0', 10) / 27);
+            const text = normalize(entry.textContent);
+            if (text) lines.push(`${'*'.repeat(depth + 1)} [[#${text}|${text}]]`);
+        });
+        return lines;
+    };
+
     const detectCodeLanguage = (code, element) => {
         const langAttr = element?.getAttribute('data-language') ||
             element?.closest('[data-language]')?.getAttribute('data-language') ||
             element?.querySelector('[data-language]')?.getAttribute('data-language');
         if (langAttr) return langAttr.toLowerCase();
+        const pickerLang = element?.querySelector('#language-selector')?.value?.toLowerCase();
+        if (pickerLang && pickerLang !== 'plain text') return pickerLang;
 
         const trimmed = code.trim();
         if (/^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|journey)\s/i.test(trimmed)) return 'mermaid';
@@ -221,8 +288,8 @@
         const headers = [];
 
         table.querySelectorAll('[role="columnheader"]').forEach(th => {
-            const label = th.querySelector('[aria-label]');
-            headers.push(escapeTableCell(label ? label.getAttribute('aria-label') : getTextContent(th) || ''));
+            const label = th.querySelector('[aria-label]:not([aria-label=" "])');
+            headers.push(escapeTableCell(label ? label.getAttribute('aria-label') : getTextContent(th).replace(/'''/g, '').replace(/\s+/g, ' ').trim() || ''));
         });
 
         if (headers.length) {
@@ -232,7 +299,7 @@
         table.querySelectorAll('tbody tr[data-rowid]').forEach(row => {
             if (row.dataset.rowid === 'HEADER_ROW_ID') return;
             const cells = [...row.querySelectorAll('[role="cell"]')]
-                .map(cell => escapeTableCell(getTextContent(cell)));
+                .map(cell => escapeTableCell(getCellText(cell)));
             if (!cells.length) return;
             lines.push('|-');
             lines.push('| ' + cells.join(' || '));
@@ -254,10 +321,13 @@
         const codeTexts = new Set();
         const codeRawTexts = new Set();
 
-        const title = getPageTitle(pages);
+        const { text: title, el: titleEl } = getPageTitle(pages);
         if (title) {
             lines.push(`= ${title} =`, '');
+            skipTitleElements(pages, title, titleEl, processed);
         }
+
+        const restoreCodeBlocks = await hydrateCodeBlocks();
 
         pages.forEach(page => {
             page.querySelectorAll('.scriptor-paragraph, .scriptor-listItem, .scriptor-component-code-block, [role="table"], [role="heading"]').forEach(el => {
@@ -275,22 +345,29 @@
 
                 if (el.classList.contains('scriptor-paragraph') && el.closest('.scriptor-component-code-block')) return;
 
-                const codeBlock = el.querySelector('.scriptor-code-wrap-on') ||
-                    (el.classList.contains('scriptor-component-code-block') ? el.querySelector('.scriptor-code-editor') : null);
+                // A paragraph can wrap a code component; handle the component once, from whichever is reached first
+                const component = el.classList.contains('scriptor-component-code-block') ? el : el.querySelector('.scriptor-component-code-block');
+                const codeBlock = component || el.querySelector('.scriptor-code-wrap-on');
 
                 if (codeBlock) {
-                    const code = [...codeBlock.querySelectorAll('.scriptor-paragraph')]
-                        .map(p => p.textContent)
-                        .join('\n')
-                        .trim() || codeBlock.textContent.trim();
+                    const codeLines = [...codeBlock.querySelectorAll('.scriptor-paragraph')].map(p => p.textContent);
+                    // A code component's own textContent is just its toolbar ("JSONShow more lines")
+                    const code = codeLines.join('\n').trim() || (component ? '' : codeBlock.textContent.trim());
                     if (code) {
                         const lang = detectCodeLanguage(code, el);
                         lines.push(...renderCodeBlock(code, lang));
                         codeTexts.add(normalize(code));
                         codeRawTexts.add(code.replace(/\s+/g, ' ').trim());
                         codeBlock.querySelectorAll('.scriptor-paragraph').forEach(p => processed.add(p));
-                        processed.add(el);
+                        processed.add(el).add(codeBlock);
                     }
+                    return;
+                }
+
+                const toc = el.querySelector('.scriptor-table-of-contents-root');
+                if (toc) {
+                    lines.push('', ...renderToc(toc), '');
+                    processed.add(el);
                     return;
                 }
 
@@ -299,7 +376,7 @@
                     const level = parseInt(heading.getAttribute('aria-level') || '1', 10);
                     const text = getTextContent(heading, true).replace(/'''/g, '').trim();
                     if (text) lines.push(...renderHeading(text, level));
-                    processed.add(el);
+                    processed.add(el).add(heading);
                     return;
                 }
 
@@ -316,8 +393,9 @@
                     const checked = checkbox?.getAttribute('aria-checked') === 'true';
                     const listParent = li.closest('ol, ul');
                     const markerEl = el.querySelector('.scriptor-listItem-marker, [class*="listItem-marker"]');
-                    const markerText = markerEl?.textContent?.trim() || '';
-                    const hasNumberMarker = /^\d+[\.\)]?$/.test(markerText);
+                    const cssMarker = li.style.getPropertyValue('--scriptor-list-marker-text').replace(/["']/g, '').trim();
+                    const markerText = markerEl?.textContent?.trim() || cssMarker;
+                    const hasNumberMarker = /^\d+[\.\)]?$|^[a-z]{1,4}[\.\)]$/i.test(markerText);
                     const dataListType = el.getAttribute('data-list-type') || el.closest('[data-list-type]')?.getAttribute('data-list-type');
                     const isOrdered = listParent?.tagName === 'OL' || hasNumberMarker || dataListType === 'ordered' || dataListType === 'number';
                     const prefix = getListPrefix(depth, isOrdered ? '#' : '*');
@@ -344,8 +422,14 @@
             });
         });
 
+        restoreCodeBlocks();
         const wikitext = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-        await copyToClipboard(wikitext);
+        try {
+            await copyToClipboard(wikitext);
+        } catch (e) {
+            alert(`Could not copy MediaWiki to clipboard: ${e.message}`);
+            return;
+        }
 
         const note = document.createElement('div');
         note.textContent = '✓ MediaWiki copied!';
