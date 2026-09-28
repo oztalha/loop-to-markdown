@@ -1,27 +1,14 @@
 // ==UserScript==
-// @name         Microsoft Loop to Markdown
+// @name         Microsoft Loop to MediaWiki
 // @namespace    http://tampermonkey.net/
-// @version      1.6
-// @description  Convert Microsoft Loop pages to Markdown
-// @author       Talha Oz (ozt@), Yuta TJ (yutatj@), Shrinivas Acharya
+// @version      1.0
+// @description  Convert Microsoft Loop pages to MediaWiki wikitext
+// @author       OpenAI Codex
 // @match        https://loop.cloud.microsoft/*
 // @match        https://*.loop.cloud.microsoft.com/*
 // @grant        GM_setClipboard
-// @updateURL    https://raw.githubusercontent.com/oztalha/loop-to-markdown/main/loop-to-markdown.user.js
-// @downloadURL  https://raw.githubusercontent.com/oztalha/loop-to-markdown/main/loop-to-markdown.user.js
 // @license      GPL-3.0
 // ==/UserScript==
-
-/*
- * Changelog:
- * v1.6 - Merged contributions:
- *   yutatj@: getTextContentFallback() for table cells with only tags, table header fallback
- *   Shrinivas: Bold text detection, code language auto-detection, ordered list support,
- *              correct heading levels (aria-level), code duplicate prevention
- * v1.5 - yutatj@: Fixed empty table cells with links/mentions
- * v1.4 - ozt@: Initial release - DOM parsing, tables, code blocks, headings, lists,
- *              checkboxes, @mentions, hyperlinks, inline code, quip link capture
- */
 
 (function() {
     'use strict';
@@ -49,13 +36,15 @@
 
     const normalize = text => {
         if (!text) return '';
-        let result = text.trim().replace(/\s+/g, ' ');
-        // Fix empty/malformed bold markers
-        result = result.replace(/\*\*\*\*/g, '').replace(/\*\*\s*\*\*/g, '');
-        result = result.replace(/(\w)\*\*(?=\w)/g, '$1 **');
-        result = result.replace(/(\S)\*\*(\w)/g, '$1** $2');
-        return result.trim();
+        return text.trim().replace(/\s+/g, ' ');
     };
+
+    const escapeHtml = text => text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+
+    const escapeTableCell = text => text.replace(/\|/g, '<nowiki>|</nowiki>');
 
     const getMention = el => {
         const avatar = el.querySelector('.fui-Avatar[aria-label]');
@@ -92,57 +81,103 @@
         return '';
     };
 
+    const formatExternalLink = (label, href) => {
+        const cleanLabel = normalize(label);
+        if (!href) return cleanLabel;
+        if (!cleanLabel || cleanLabel === href) return href;
+        return `[${href} ${cleanLabel}]`;
+    };
+
+    const formatCheckbox = checked => checked ? '☑' : '☐';
+    const formatInlineCode = text => `<code>${escapeHtml(text)}</code>`;
+    const formatBold = text => `'''${text}'''`;
+
     const getTextContent = (container, skipTables = false) => {
         let text = '';
         const targets = container.querySelectorAll('.scriptor-textRun, [data-testid="resolvedAtMention"]');
         if (targets.length === 0) {
             return getTextContentFallback(container);
         }
+
         targets.forEach(node => {
             if (skipTables && node.closest('table')) return;
             if (node.dataset.testid === 'resolvedAtMention') {
                 text += getMention(node);
-            } else if (!node.closest('[data-testid="resolvedAtMention"]')) {
-                if (node.classList.contains('scriptor-hyperlink')) {
-                    const href = (node.getAttribute('title') || '').split('\n')[0];
-                    if (href) text += `[${node.textContent}](${href})`;
-                } else if (node.classList.contains('scriptor-code-editor')) {
-                    text += '`' + node.textContent + '`';
-                } else {
-                    let content = node.textContent;
-                    const style = window.getComputedStyle(node);
-                    const isBold = parseInt(style.fontWeight) >= 600 || style.fontWeight === 'bold' || style.fontWeight === 'bolder';
-                    if (isBold && content.trim()) {
-                        const lead = content.match(/^\s*/)[0], trail = content.match(/\s*$/)[0];
-                        text += `${lead}**${content.trim()}**${trail}`;
-                    } else {
-                        text += content;
-                    }
-                }
+                return;
             }
+            if (node.closest('[data-testid="resolvedAtMention"]')) return;
+
+            if (node.classList.contains('scriptor-hyperlink')) {
+                const href = (node.getAttribute('title') || '').split('\n')[0];
+                text += formatExternalLink(node.textContent, href);
+                return;
+            }
+
+            if (node.classList.contains('scriptor-code-editor')) {
+                text += formatInlineCode(node.textContent);
+                return;
+            }
+
+            const content = node.textContent;
+            const style = window.getComputedStyle(node);
+            const isBold = parseInt(style.fontWeight, 10) >= 600 || style.fontWeight === 'bold' || style.fontWeight === 'bolder';
+            if (isBold && content.trim()) {
+                const lead = content.match(/^\s*/)[0];
+                const trail = content.match(/\s*$/)[0];
+                text += `${lead}${formatBold(content.trim())}${trail}`;
+                return;
+            }
+
+            text += content;
         });
+
         return normalize(text);
     };
 
     const getTextContentFallback = (container) => {
         let text = '';
+
         const walk = (node) => {
-            if (node.nodeType === Node.TEXT_NODE) { text += node.textContent; return; }
+            if (node.nodeType === Node.TEXT_NODE) {
+                text += node.textContent;
+                return;
+            }
             if (node.nodeType !== Node.ELEMENT_NODE) return;
-            const el = node, tag = el.tagName.toLowerCase();
+
+            const el = node;
+            const tag = el.tagName.toLowerCase();
+
             if (el.dataset?.testid === 'resolvedAtMention') {
                 const mention = getMention(el);
-                if (mention) { text += mention; return; }
+                if (mention) {
+                    text += mention;
+                    return;
+                }
             }
+
             if (tag === 'a') {
                 const href = el.getAttribute('href') || el.getAttribute('title')?.split('\n')[0] || '';
                 const linkText = el.textContent.trim();
-                if (href && linkText) { text += `[${linkText}](${href})`; return; }
+                if (href && linkText) {
+                    text += formatExternalLink(linkText, href);
+                    return;
+                }
             }
-            if (el.classList?.contains('scriptor-code-editor')) { text += '`' + el.textContent + '`'; return; }
-            for (const child of el.childNodes) walk(child);
+
+            if (el.classList?.contains('scriptor-code-editor')) {
+                text += formatInlineCode(el.textContent);
+                return;
+            }
+
+            for (const child of el.childNodes) {
+                walk(child);
+            }
         };
-        for (const child of container.childNodes) walk(child);
+
+        for (const child of container.childNodes) {
+            walk(child);
+        }
+
         return normalize(text);
     };
 
@@ -151,6 +186,7 @@
             element?.closest('[data-language]')?.getAttribute('data-language') ||
             element?.querySelector('[data-language]')?.getAttribute('data-language');
         if (langAttr) return langAttr.toLowerCase();
+
         const trimmed = code.trim();
         if (/^(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|journey)\s/i.test(trimmed)) return 'mermaid';
         if (/^(def |class |import |from |async def |@\w+)/.test(trimmed)) return 'python';
@@ -165,35 +201,68 @@
         return '';
     };
 
+    const renderCodeBlock = (code, lang) => {
+        const escaped = escapeHtml(code);
+        if (lang) {
+            return ['', `<syntaxhighlight lang="${lang}">`, escaped, '</syntaxhighlight>', ''];
+        }
+        return ['', '<pre>', escaped, '</pre>', ''];
+    };
+
+    const renderHeading = (text, level) => {
+        const markers = '='.repeat(Math.min(Math.max(level, 1), 6));
+        return ['', `${markers} ${text} ${markers}`, ''];
+    };
+
+    const getListPrefix = (depth, kind) => kind.repeat(depth + 1) + ' ';
+
     const parseTable = table => {
-        const lines = [], headers = [];
+        const lines = ['{| class="wikitable"'];
+        const headers = [];
+
         table.querySelectorAll('[role="columnheader"]').forEach(th => {
             const label = th.querySelector('[aria-label]');
-            headers.push(label ? label.getAttribute('aria-label') : getTextContent(th) || '');
+            headers.push(escapeTableCell(label ? label.getAttribute('aria-label') : getTextContent(th) || ''));
         });
+
         if (headers.length) {
-            lines.push('| ' + headers.join(' | ') + ' |', '| ' + headers.map(() => '---').join(' | ') + ' |');
+            lines.push('! ' + headers.join(' !! '));
         }
+
         table.querySelectorAll('tbody tr[data-rowid]').forEach(row => {
             if (row.dataset.rowid === 'HEADER_ROW_ID') return;
-            const cells = [...row.querySelectorAll('[role="cell"]')].map(cell => getTextContent(cell).replace(/\|/g, '\\|'));
-            if (cells.length) lines.push('| ' + cells.join(' | ') + ' |');
+            const cells = [...row.querySelectorAll('[role="cell"]')]
+                .map(cell => escapeTableCell(getTextContent(cell)));
+            if (!cells.length) return;
+            lines.push('|-');
+            lines.push('| ' + cells.join(' || '));
         });
+
+        lines.push('|}');
         return lines;
     };
 
-    async function convertToMarkdown() {
+    async function convertToMediaWiki() {
         const pages = [...document.querySelectorAll('.scriptor-pageFrame')].filter(p => !p.closest('table'));
-        if (!pages.length) return alert('No Loop content found');
+        if (!pages.length) {
+            alert('No Loop content found');
+            return;
+        }
 
-        const lines = [], processed = new Set(), codeTexts = new Set(), codeRawTexts = new Set();
+        const lines = [];
+        const processed = new Set();
+        const codeTexts = new Set();
+        const codeRawTexts = new Set();
 
         const title = getPageTitle(pages);
-        if (title) lines.push(`# ${title}`, '');
+        if (title) {
+            lines.push(`= ${title} =`, '');
+        }
 
         pages.forEach(page => {
             page.querySelectorAll('.scriptor-paragraph, .scriptor-listItem, .scriptor-component-code-block, [role="table"], [role="heading"]').forEach(el => {
                 if (processed.has(el)) return;
+
                 const inTable = el.closest('table');
                 if (inTable && inTable !== el) return;
 
@@ -205,13 +274,18 @@
                 }
 
                 if (el.classList.contains('scriptor-paragraph') && el.closest('.scriptor-component-code-block')) return;
+
                 const codeBlock = el.querySelector('.scriptor-code-wrap-on') ||
                     (el.classList.contains('scriptor-component-code-block') ? el.querySelector('.scriptor-code-editor') : null);
+
                 if (codeBlock) {
-                    const code = [...codeBlock.querySelectorAll('.scriptor-paragraph')].map(p => p.textContent).join('\n').trim() || codeBlock.textContent.trim();
+                    const code = [...codeBlock.querySelectorAll('.scriptor-paragraph')]
+                        .map(p => p.textContent)
+                        .join('\n')
+                        .trim() || codeBlock.textContent.trim();
                     if (code) {
                         const lang = detectCodeLanguage(code, el);
-                        lines.push('', '```' + lang, code, '```', '');
+                        lines.push(...renderCodeBlock(code, lang));
                         codeTexts.add(normalize(code));
                         codeRawTexts.add(code.replace(/\s+/g, ' ').trim());
                         codeBlock.querySelectorAll('.scriptor-paragraph').forEach(p => processed.add(p));
@@ -223,9 +297,8 @@
                 const heading = el.getAttribute('role') === 'heading' ? el : el.querySelector('[role="heading"]');
                 if (heading) {
                     const level = parseInt(heading.getAttribute('aria-level') || '1', 10);
-                    const markdownLevel = Math.min(level + 1, 6);
-                    let text = getTextContent(heading, true).replace(/\*\*/g, '').trim();
-                    if (text) lines.push('', `${'#'.repeat(markdownLevel)} ${text}`, '');
+                    const text = getTextContent(heading, true).replace(/'''/g, '').trim();
+                    if (text) lines.push(...renderHeading(text, level));
                     processed.add(el);
                     return;
                 }
@@ -233,10 +306,12 @@
                 if (el.classList.contains('scriptor-listItem')) {
                     const li = el.querySelector('li');
                     if (!li) return;
+
                     const text = getTextContent(li);
                     if (!text) return;
-                    const margin = parseInt((el.getAttribute('style') || '').match(/margin-left:\s*(\d+)/)?.[1] || 0);
-                    const indent = '  '.repeat(Math.max(0, Math.floor((margin - 27) / 27)));
+
+                    const margin = parseInt((el.getAttribute('style') || '').match(/margin-left:\s*(\d+)/)?.[1] || 0, 10);
+                    const depth = Math.max(0, Math.floor((margin - 27) / 27));
                     const checkbox = li.querySelector('.scriptor-listItem-marker-checkbox');
                     const checked = checkbox?.getAttribute('aria-checked') === 'true';
                     const listParent = li.closest('ol, ul');
@@ -245,17 +320,9 @@
                     const hasNumberMarker = /^\d+[\.\)]?$/.test(markerText);
                     const dataListType = el.getAttribute('data-list-type') || el.closest('[data-list-type]')?.getAttribute('data-list-type');
                     const isOrdered = listParent?.tagName === 'OL' || hasNumberMarker || dataListType === 'ordered' || dataListType === 'number';
-                    let marker;
-                    if (checkbox) {
-                        marker = checked ? '- [x] ' : '- [ ] ';
-                    } else if (isOrdered) {
-                        const numMatch = markerText.match(/^(\d+)/);
-                        const value = numMatch ? numMatch[1] : (li.getAttribute('value') || '1');
-                        marker = `${value}. `;
-                    } else {
-                        marker = '- ';
-                    }
-                    lines.push(indent + marker + text);
+                    const prefix = getListPrefix(depth, isOrdered ? '#' : '*');
+                    const itemText = checkbox ? `${formatCheckbox(checked)} ${text}` : text;
+                    lines.push(prefix + itemText);
                     processed.add(el);
                     return;
                 }
@@ -264,7 +331,9 @@
                     let text = getTextContent(el, true);
                     el.querySelectorAll('a[href*="quip"]').forEach(link => {
                         const href = link.getAttribute('href');
-                        if (href) text += ` [${link.textContent.trim() || href.split('/').pop()}](${href})`;
+                        if (href) {
+                            text += ` ${formatExternalLink(link.textContent.trim() || href.split('/').pop(), href)}`;
+                        }
                     });
                     text = normalize(text);
                     const isCodeDuplicate = [...codeTexts].some(c => c.includes(text) || text.includes(c)) ||
@@ -275,20 +344,19 @@
             });
         });
 
-        let markdown = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-        markdown = markdown.replace(/(```\w*\n[\s\S]*?\n```)\n\n\1/g, '$1');
-        await copyToClipboard(markdown);
+        const wikitext = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+        await copyToClipboard(wikitext);
 
         const note = document.createElement('div');
-        note.textContent = '✓ Markdown copied!';
+        note.textContent = '✓ MediaWiki copied!';
         note.style.cssText = 'position:fixed;top:20px;right:20px;background:#4CAF50;color:white;padding:12px 16px;border-radius:5px;z-index:10000;font-family:sans-serif';
         document.body.appendChild(note);
         setTimeout(() => note.remove(), 2000);
     }
 
     const btn = document.createElement('button');
-    btn.textContent = '📋 Copy as Markdown';
-    btn.style.cssText = 'position:fixed;bottom:20px;left:20px;background:#0078D4;color:white;border:none;padding:8px 12px;border-radius:5px;cursor:pointer;z-index:10000;font-family:sans-serif;font-size:12px';
-    btn.onclick = convertToMarkdown;
+    btn.textContent = '📋 Copy as MediaWiki';
+    btn.style.cssText = 'position:fixed;bottom:20px;left:20px;background:#3366CC;color:white;border:none;padding:8px 12px;border-radius:5px;cursor:pointer;z-index:10000;font-family:sans-serif;font-size:12px';
+    btn.onclick = convertToMediaWiki;
     document.body.appendChild(btn);
 })();
